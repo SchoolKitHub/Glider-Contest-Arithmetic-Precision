@@ -389,7 +389,7 @@ def query():
     # Swap functions are high-risk because they often involve two tokens
     # with potentially different decimals. Using case-insensitive regex.
     swap_functions = Functions().with_name_regex(
-        ".*swap.*", sensitivity=False
+        "[Ss][Ww][Aa][Pp]"
     ).exec(100)
 
     # Analyze each swap function
