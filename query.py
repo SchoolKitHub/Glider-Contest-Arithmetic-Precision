@@ -171,6 +171,133 @@ def contains_scaling_constant(instruction):
     return False
 
 
+def has_zero_check_downstream(instruction):
+    """
+    Detect if an instruction's computed result is checked for zero/null.
+
+    Optimized version that checks the immediate next few instructions for
+    zero-checks rather than doing expensive full dataflow analysis. This
+    looks for patterns like require(x > 0) immediately after the computation.
+
+    Args:
+        instruction: The arithmetic instruction to analyze.
+
+    Returns:
+        bool: True if a zero/null check is found in immediate context;
+            False otherwise.
+
+    Implementation Details:
+        - Checks instruction's parent block for following instructions
+        - Limits lookahead to avoid expensive analysis
+        - Looks for common validation patterns
+        - Handles exceptions gracefully for edge cases
+    """
+    try:
+        # Try to get the instruction's parent block for context
+        parent = instruction.parent
+        if parent is None:
+            return False
+
+        # Get the function containing this instruction
+        func = parent
+        while func and not hasattr(func, 'instructions'):
+            func = getattr(func, 'parent', None)
+        
+        if func is None:
+            return False
+
+        # Get all instructions in the function
+        all_instrs = func.instructions().exec()
+        if not all_instrs:
+            return False
+
+        # Find current instruction index
+        try:
+            current_idx = all_instrs.index(instruction)
+        except (ValueError, TypeError):
+            # Can't find this instruction in the list, bail out
+            return False
+
+        # Check the next few instructions (limit lookahead to avoid timeout)
+        lookahead_limit = min(5, len(all_instrs) - current_idx - 1)
+        
+        for i in range(1, lookahead_limit + 1):
+            next_instr = all_instrs[current_idx + i]
+            
+            try:
+                # Check if this is a require/assert with zero-check pattern
+                expr_str = next_instr.expression
+                
+                # Quick pattern matching for common zero checks
+                if any(pattern in expr_str for pattern in [
+                    '> 0', '!= 0', '>= 1',        # Common checks
+                    'require(', 'assert('         # Guard patterns
+                ]):
+                    # Found a zero check nearby
+                    return True
+            except Exception:
+                # Skip instructions we can't analyze
+                continue
+
+    except Exception:
+        # Any error during analysis - return False conservatively
+        pass
+
+    # No zero-check found in immediate context
+    return False
+
+
+def scan_instructions_for_precision_issues(func, check_zero=False):
+    """
+    Shared helper: scan function instructions for precision vulnerabilities.
+
+    This helper consolidates the common scanning logic used across all three
+    detection strategies. It iterates through a function's instructions,
+    applying consistent filters and checks for unscaled arithmetic.
+
+    Args:
+        func: The function object to scan.
+        check_zero (bool): If True, skip instructions with downstream zero
+            checks (used to reduce false positives). Defaults to False.
+
+    Returns:
+        list: Instructions flagged as potential precision vulnerabilities.
+    """
+    vulnerabilities = []
+    
+    # Retrieve all instructions in the function
+    instructions = func.instructions().exec()
+
+    # Analyze each instruction
+    for instr in instructions:
+        # Filter 1: Skip if statements (control flow, not arithmetic)
+        if instr.is_if():
+            continue
+
+        # Filter 2: Get the functions being called in this instruction
+        callee_names = instr.callee_names()
+        
+        # Filter 3: Skip guard clauses (require, assert, revert)
+        # These are validation checks, not arithmetic operations
+        if any(guard in callee_names for guard in [
+            'require', 'assert', 'revert'
+        ]):
+            continue
+
+        # Filter 4: Optional zero-check detection (reduces false positives)
+        if check_zero and has_zero_check_downstream(instr):
+            # This value is validated downstream, skip it
+            continue
+
+        # Core vulnerability check: arithmetic without scaling
+        if (contains_arithmetic(instr) and
+                not contains_scaling_constant(instr)):
+            # Found potential precision vulnerability
+            vulnerabilities.append(instr)
+
+    return vulnerabilities
+
+
 def query():
     """
     Execute the decimal precision mismatch detection query.
@@ -252,38 +379,17 @@ def query():
                 # This function calls decimals() - likely handles scaling
                 continue
 
-            # Filter 2: Analyze each instruction in the function
-            instructions = func.instructions().exec()
-
-            # Check each instruction for unscaled arithmetic
-            for instr in instructions:
-                # Skip if statements - control flow doesn't need scaling
-                if instr.is_if():
-                    continue
-
-                # Get the list of functions being called in this instruction
-                callee_names = instr.callee_names()
-                
-                # Skip guard clauses (require, assert, revert)
-                # These are validation checks, not arithmetic operations
-                if any(guard in callee_names for guard in [
-                    'require', 'assert', 'revert'
-                ]):
-                    continue
-
-                # Core vulnerability check: arithmetic without scaling
-                if (contains_arithmetic(instr) and
-                        not contains_scaling_constant(instr)):
-                    # Found potential precision vulnerability
-                    results.append(instr)
+            # Use shared helper to scan instructions (with zero-check filtering)
+            vulns = scan_instructions_for_precision_issues(func, check_zero=True)
+            results.extend(vulns)
 
     # =========================================================================
     # STRATEGY 2: Multi-Token Swap Function Analysis
     # =========================================================================
     # Swap functions are high-risk because they often involve two tokens
-    # with potentially different decimals
+    # with potentially different decimals. Using case-insensitive regex.
     swap_functions = Functions().with_name_regex(
-        ".*swap.*"
+        ".*swap.*", sensitivity=False
     ).exec(100)
 
     # Analyze each swap function
@@ -299,29 +405,9 @@ def query():
         if len(decimals_calls) >= 2:
             continue
 
-        # Filter 2: Look for unscaled arithmetic in the swap logic
-        instructions = func.instructions().exec()
-
-        # Check each instruction
-        for instr in instructions:
-            # Skip if statements
-            if instr.is_if():
-                continue
-
-            # Get the functions being called
-            callee_names = instr.callee_names()
-            
-            # Skip guard clauses
-            if any(guard in callee_names for guard in [
-                'require', 'assert', 'revert'
-            ]):
-                continue
-
-            # Vulnerability check: arithmetic without scaling
-            if (contains_arithmetic(instr) and
-                    not contains_scaling_constant(instr)):
-                # Found unscaled arithmetic in swap
-                results.append(instr)
+        # Use shared helper to scan instructions (with zero-check filtering)
+        vulns = scan_instructions_for_precision_issues(func, check_zero=True)
+        results.extend(vulns)
 
     # =========================================================================
     # STRATEGY 3: Hardcoded Scaling Without Proper Decimals Checking
@@ -342,7 +428,7 @@ def query():
             # This function checks decimals dynamically
             continue
 
-        # Filter 2: Find hardcoded scaling without decimal verification
+        # Retrieve all instructions in the function
         instructions = func.instructions().exec()
 
         # Check each instruction
@@ -364,6 +450,8 @@ def query():
             # This suggests hardcoded decimal assumptions without runtime
             # verification. This fails when token decimals differ from
             # the hardcoded assumption (e.g., assuming 1e18 but receiving 1e6)
+            # Note: Skip zero-check here since hardcoded scaling is rare
+            # and already a strong signal of vulnerability
             if (contains_arithmetic(instr) and
                     contains_scaling_constant(instr)):
                 # Found hardcoded scaling without decimal checks
